@@ -9,7 +9,7 @@ import threading
 from datetime import datetime
 
 # PostgreSQL Configuration
-DATABASE_URL = "postgresql://db_2nmh_user:aIc3Okz1OpDVoDXSyfQ9lKBKoKbE8wSE@dpg-d69j3i0gjchc73djahh0-a/db_2nmh"
+DATABASE_URL = "postgresql://db_3ycg_user:Gg8ZmUfKIl9hmDDAD4bBjG6VyR1NGWBY@dpg-d6ikggngi27c738k1e10-a.oregon-postgres.render.com/db_3ycg"
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
