@@ -3,16 +3,21 @@ import json
 import time
 import uuid
 import threading
+import atexit
 import requests
 import base64
 from io import BytesIO
 from PIL import Image
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 import database as db
 
 app = Flask(__name__)
 CORS(app)
+
+# Graceful shutdown: polling thread'leri temiz kapansın
+_shutdown_event = threading.Event()
+atexit.register(lambda: _shutdown_event.set())
 
 # --- Configuration & Constants ---
 API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.ewogICJyb2xlIjogImFub24iLAogICJpc3MiOiAic3VwYWJhc2UiLAogICJpYXQiOiAxNzM0OTY5NjAwLAogICJleHAiOiAxODkyNzM2MDAwCn0.4NnK23LGYvKPGuKI5rwQn2KbLMzzdE4jXpHwbGCqPqY"
@@ -73,8 +78,12 @@ def refresh_quota(token):
     except:
         pass
 
-def login_with_retry(api_key_id):
-    """Tries logging in with available accounts until one succeeds."""
+def login_with_retry(api_key_id, task_id=None):
+    """Tries logging in with available accounts until one succeeds.
+    
+    task_id parametresi verildiğinde, hesap alındığı milisaniyede veritabanında
+    task ile atomik olarak eşleştirilir (çökme koruması için).
+    """
     tried_count = 0
     max_tries = db.get_account_count(api_key_id)
     
@@ -83,7 +92,9 @@ def login_with_retry(api_key_id):
         return None, None
     
     while tried_count < max_tries:
-        account = db.get_next_account(api_key_id)
+        # DEĞİŞİKLİK: task_id'yi de gönderiyoruz.
+        # Böylece hesap alındığı milisaniyede veritabanında task ile eşleşiyor.
+        account = db.get_next_account(api_key_id, task_id)
         if not account:
             break
         
@@ -104,11 +115,11 @@ def login_with_retry(api_key_id):
                     refresh_quota(token)
                     return token, account
             print(f"Login failed for {account['email']}: {resp.status_code} - {resp.text}")
-            # Release account if login fails (invalid credentials or temporary block)
+            # Login başarısızsa hesabı hemen bırak
             db.release_account(api_key_id, account['email'])
         except Exception as e:
             print(f"Login error for {account['email']}: {e}")
-            # Release on connection errors too
+            # Hata durumunda da bırak
             db.release_account(api_key_id, account['email'])
             
     return None, None
@@ -152,11 +163,15 @@ def process_image_task(task_id, params, api_key_id):
     try:
         db.update_task_status(task_id, 'running')
         try:
-            token, account = login_with_retry(api_key_id)
+            # task_id gönderiyoruz: hesap alındığı anda atomik olarak task'e yazılır (çökme koruması)
+            token, account = login_with_retry(api_key_id, task_id=task_id)
             if not token:
                 db.update_task_status(task_id, 'failed')
                 db.add_task_log(task_id, "All accounts failed to login.")
                 return
+
+            # NOT: db.update_task_account() artık burada çağrılmıyor.
+            # get_next_account() zaten task_id ile atomik olarak account_email'i yazdı.
 
             headers = {"authorization": f"Bearer {token}", **DEVICE_HEADERS}
             
@@ -192,6 +207,9 @@ def process_image_task(task_id, params, api_key_id):
             if user_image_ids:
                 payload["userImageIds"] = user_image_ids
 
+            # Save token BEFORE submit so crash during submit can still recover
+            db.update_task_token(task_id, token)
+
             resp = requests.post(URL_SUBMIT_IMG, headers=headers, json=payload)
             resp_json = resp.json()
             
@@ -208,7 +226,8 @@ def process_image_task(task_id, params, api_key_id):
             db.add_task_log(task_id, f"API Task ID: {api_task_id}")
 
             for _ in range(300):
-                time.sleep(2)
+                if _shutdown_event.wait(2):
+                    return  # Shutdown — task 'running' kalır, recovery halleder
                 try:
                     poll = requests.get(URL_ASSETS, headers=headers).json()
                     groups = poll.get('data', {}).get('data', {}).get('groups', [])
@@ -243,10 +262,14 @@ def process_video_task(task_id, params, api_key_id):
     try:
         db.update_task_status(task_id, 'running')
         try:
-            token, account = login_with_retry(api_key_id)
+            # task_id gönderiyoruz: hesap alındığı anda atomik olarak task'e yazılır (çökme koruması)
+            token, account = login_with_retry(api_key_id, task_id=task_id)
             if not token:
                 db.update_task_status(task_id, 'failed')
                 return
+
+            # NOT: db.update_task_account() artık burada çağrılmıyor.
+            # get_next_account() zaten task_id ile atomik olarak account_email'i yazdı.
 
             headers = {"authorization": f"Bearer {token}", **DEVICE_HEADERS}
             
@@ -305,6 +328,9 @@ def process_video_task(task_id, params, api_key_id):
                     payload["modelVersion"] = "MODEL_ELEVEN_TEXT_TO_VIDEO_V2"
                     url_submit = URL_SUBMIT_TXT_VIDEO
 
+            # Save token BEFORE submit so crash during submit can still recover
+            db.update_task_token(task_id, token)
+
             resp = requests.post(url_submit, headers=headers, json=payload)
             resp_json = resp.json()
             
@@ -320,7 +346,8 @@ def process_video_task(task_id, params, api_key_id):
             db.add_task_log(task_id, f"API Task ID: {api_task_id}")
             
             for _ in range(600):
-                time.sleep(5)
+                if _shutdown_event.wait(5):
+                    return  # Shutdown — task 'running' kalır, recovery halleder
                 try:
                     poll = requests.get(URL_VIDEO_TASKS, headers=headers).json()
                     video_list = poll.get('data', {}).get('data', {}).get('data', [])
@@ -418,12 +445,99 @@ def process_tts_task(task_id, params):
 
 # --- Recovery Logic ---
 
-def poll_image_recovery(task_id, api_task_id, token):
+def check_deevid_for_task(task_id, mode, token, account_email=None, api_key_id=None):
+    """Checks Deevid API for a task that may have been submitted before crash.
+    Uses the saved token to check recent assets/tasks.
+    If found: saves external_task_id and starts polling.
+    If not found: marks task as failed and releases account.
+    """
+    try:
+        headers = {"authorization": f"Bearer {token}", **DEVICE_HEADERS}
+        
+        if mode == 'image':
+            # Check recent image assets
+            try:
+                poll = requests.get(URL_ASSETS, headers=headers, timeout=15).json()
+                groups = poll.get('data', {}).get('data', {}).get('groups', [])
+                for group in groups:
+                    for item in group.get('items', []):
+                        creation = item.get('detail', {}).get('creation', {})
+                        task_state = creation.get('taskState')
+                        api_task_id = creation.get('taskId')
+                        
+                        if api_task_id and task_state in ('PENDING', 'RUNNING', 'SUBMITTED'):
+                            # Found an active task — save and poll
+                            api_task_id = str(api_task_id)
+                            db.update_task_external_data(task_id, api_task_id, token)
+                            db.add_task_log(task_id, f"[RECOVERY] Found active task on Deevid: {api_task_id}")
+                            print(f"  [RECOVERY] Task {task_id}: found active Deevid task {api_task_id}, resuming polling")
+                            threading.Thread(
+                                target=poll_image_recovery,
+                                args=(task_id, api_task_id, token, account_email, api_key_id)
+                            ).start()
+                            return
+                        elif api_task_id and task_state == 'SUCCESS':
+                            urls = creation.get('noWaterMarkImageUrl', [])
+                            if urls:
+                                db.update_task_status(task_id, 'completed', urls[0])
+                                print(f"  [RECOVERY] Task {task_id}: found completed result on Deevid")
+                                return
+            except Exception as e:
+                print(f"  [RECOVERY] Task {task_id}: Deevid check failed: {e}")
+        
+        elif mode == 'video':
+            # Check recent video tasks
+            try:
+                poll = requests.get(URL_VIDEO_TASKS, headers=headers, timeout=15).json()
+                video_list = poll.get('data', {}).get('data', {}).get('data', [])
+                if not video_list and isinstance(poll.get('data', {}).get('data'), list):
+                    video_list = poll['data']['data']
+                
+                for v in video_list:
+                    task_state = v.get('taskState')
+                    api_task_id = v.get('taskId')
+                    
+                    if api_task_id and task_state in ('PENDING', 'RUNNING', 'SUBMITTED'):
+                        api_task_id = str(api_task_id)
+                        db.update_task_external_data(task_id, api_task_id, token)
+                        db.add_task_log(task_id, f"[RECOVERY] Found active video task on Deevid: {api_task_id}")
+                        print(f"  [RECOVERY] Task {task_id}: found active Deevid video task {api_task_id}, resuming polling")
+                        threading.Thread(
+                            target=poll_video_recovery,
+                            args=(task_id, api_task_id, token, account_email, api_key_id)
+                        ).start()
+                        return
+                    elif api_task_id and task_state == 'SUCCESS':
+                        url = v.get('noWaterMarkVideoUrl') or v.get('noWatermarkVideoUrl')
+                        if isinstance(url, list) and url: url = url[0]
+                        if url:
+                            db.update_task_status(task_id, 'completed', url)
+                            print(f"  [RECOVERY] Task {task_id}: found completed video on Deevid")
+                            return
+            except Exception as e:
+                print(f"  [RECOVERY] Task {task_id}: Deevid video check failed: {e}")
+        
+        # Nothing found on Deevid — submit never went through
+        db.update_task_status(task_id, 'failed')
+        db.add_task_log(task_id, "[RECOVERY] No active task found on Deevid after crash — submit likely never completed.")
+        if account_email and api_key_id:
+            db.release_account(api_key_id, account_email)
+            print(f"  [RECOVERY] Task {task_id}: no Deevid task found, account {account_email} released")
+        else:
+            print(f"  [RECOVERY] Task {task_id}: no Deevid task found, marked failed")
+    except Exception as e:
+        print(f"  [RECOVERY] Task {task_id}: check_deevid error: {e}")
+        db.update_task_status(task_id, 'failed')
+        if account_email and api_key_id:
+            db.release_account(api_key_id, account_email)
+
+def poll_image_recovery(task_id, api_task_id, token, account_email=None, api_key_id=None):
     """Polling worker for recovered image tasks."""
     try:
         headers = {"authorization": f"Bearer {token}", **DEVICE_HEADERS}
         for _ in range(300):
-            time.sleep(5)
+            if _shutdown_event.wait(5):
+                return  # Shutdown — task 'running' kalır, recovery halleder
             try:
                 poll = requests.get(URL_ASSETS, headers=headers).json()
                 groups = poll.get('data', {}).get('data', {}).get('groups', [])
@@ -438,20 +552,27 @@ def poll_image_recovery(task_id, api_task_id, token):
                                     return
                             elif creation.get('taskState') == 'FAIL':
                                 db.update_task_status(task_id, 'failed')
+                                if account_email and api_key_id:
+                                    db.release_account(api_key_id, account_email)
                                 return
             except:
                 pass
         db.update_task_status(task_id, 'timeout')
+        if account_email and api_key_id:
+            db.release_account(api_key_id, account_email)
     except Exception as e:
         db.add_task_log(task_id, f"Recovery error: {str(e)}")
         db.update_task_status(task_id, 'failed')
+        if account_email and api_key_id:
+            db.release_account(api_key_id, account_email)
 
-def poll_video_recovery(task_id, api_task_id, token):
+def poll_video_recovery(task_id, api_task_id, token, account_email=None, api_key_id=None):
     """Polling worker for recovered video tasks."""
     try:
         headers = {"authorization": f"Bearer {token}", **DEVICE_HEADERS}
         for _ in range(600):
-            time.sleep(10)
+            if _shutdown_event.wait(10):
+                return  # Shutdown — task 'running' kalır, recovery halleder
             try:
                 poll = requests.get(URL_VIDEO_TASKS, headers=headers).json()
                 video_list = poll.get('data', {}).get('data', {}).get('data', [])
@@ -468,34 +589,87 @@ def poll_video_recovery(task_id, api_task_id, token):
                                 return
                         elif v.get('taskState') == 'FAIL':
                             db.update_task_status(task_id, 'failed')
+                            if account_email and api_key_id:
+                                db.release_account(api_key_id, account_email)
                             return
             except:
                 pass
         db.update_task_status(task_id, 'timeout')
+        if account_email and api_key_id:
+            db.release_account(api_key_id, account_email)
     except Exception as e:
         db.add_task_log(task_id, f"Recovery error: {str(e)}")
         db.update_task_status(task_id, 'failed')
+        if account_email and api_key_id:
+            db.release_account(api_key_id, account_email)
 
 def resume_incomplete_tasks():
-    """Finds incomplete tasks and starts recovery polling."""
-    print("Checking for incomplete tasks to recover...")
+    """Recovers stale tasks and resumes polling for submitted ones."""
+    print("=" * 50)
+    print("[STARTUP] Starting crash recovery...")
+    
+    # Phase 1: Clean up truly stale tasks + get tasks that need Deevid check
+    try:
+        recovery_result = db.recover_stale_tasks()
+        if recovery_result['failed_count'] > 0:
+            print(f"[STARTUP] Marked {recovery_result['failed_count']} tasks as failed (never logged in)")
+    except Exception as e:
+        print(f"[STARTUP] Error during stale task recovery: {e}")
+        recovery_result = {'needs_check': []}
+    
+    # Phase 2: Check Deevid API for tasks that had token but no external_task_id
+    needs_check = recovery_result.get('needs_check', [])
+    if needs_check:
+        print(f"[STARTUP] Checking Deevid API for {len(needs_check)} tasks that may have been submitted...")
+        for t in needs_check:
+            threading.Thread(
+                target=check_deevid_for_task,
+                args=(t['task_id'], t['mode'], t['token'], t.get('account_email'), t.get('api_key_id'))
+            ).start()
+    
+    # Phase 3: Resume polling for tasks that WERE confirmed submitted (have external_task_id)
     try:
         tasks = db.get_incomplete_tasks()
+        if tasks:
+            print(f"[STARTUP] Resuming polling for {len(tasks)} confirmed submitted tasks...")
+        else:
+            print(f"[STARTUP] No confirmed tasks to resume.")
+            
         for t in tasks:
             task_id = t['task_id']
             mode = t['mode']
             external_id = t['external_task_id']
             token = t['token']
+            account_email = t.get('account_email')
+            api_key_id = t.get('api_key_id')
             
-            print(f"Resuming task {task_id} ({mode}) - External ID: {external_id}")
+            print(f"  [RESUME] Task {task_id} ({mode}) - External ID: {external_id}")
             if mode == 'image':
-                threading.Thread(target=poll_image_recovery, args=(task_id, external_id, token)).start()
+                threading.Thread(
+                    target=poll_image_recovery,
+                    args=(task_id, external_id, token, account_email, api_key_id)
+                ).start()
             elif mode == 'video':
-                threading.Thread(target=poll_video_recovery, args=(task_id, external_id, token)).start()
+                threading.Thread(
+                    target=poll_video_recovery,
+                    args=(task_id, external_id, token, account_email, api_key_id)
+                ).start()
     except Exception as e:
-        print(f"Error during task recovery check: {e}")
+        print(f"[STARTUP] Error during task resume: {e}")
+    
+    print("[STARTUP] Crash recovery complete.")
+    print("=" * 50)
 
 # --- API Routes ---
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    print(f"[ERROR] {request.method} {request.path} → {type(e).__name__}: {e}")
+    return jsonify({"error": "Internal server error"}), 500
+
+@app.route('/', methods=['GET'])
+def index():
+    return render_template('index.html')
 
 @app.route('/api/generate/image', methods=['POST'])
 def generate_image():
@@ -692,15 +866,3 @@ def delete_account(email):
         return jsonify({"message": f"Account {email} deleted"})
     else:
         return jsonify({"error": "Account not found"}), 404
-
-# --- Startup ---
-
-# Initialize database
-db.init_db()
-# Resume incomplete tasks on startup
-resume_incomplete_tasks()
-
-if __name__ == '__main__':
-    print(f"Maximum concurrent tasks: {MAX_CONCURRENT_TASKS}")
-    print("API ready. Use any API key to authenticate - each key has isolated data.")
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
