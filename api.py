@@ -31,6 +31,7 @@ URL_UPLOAD = "https://api.deevid.ai/file-upload/image"
 URL_SUBMIT_IMG = "https://api.deevid.ai/text-to-image/task/submit"
 URL_SUBMIT_VIDEO = "https://api.deevid.ai/image-to-video/task/submit"
 URL_SUBMIT_TXT_VIDEO = "https://api.deevid.ai/text-to-video/task/submit"
+URL_SUBMIT_CHARACTER_VIDEO = "https://api.deevid.ai/character-to-video/task/submit"
 URL_ASSETS = "https://api.deevid.ai/my-assets?limit=50&assetType=All&filter=CREATION"
 URL_VIDEO_TASKS = "https://api.deevid.ai/video/tasks?page=1&size=20"
 URL_QUOTA = "https://api.deevid.ai/subscription/plan"
@@ -39,6 +40,24 @@ URL_QUOTA = "https://api.deevid.ai/subscription/plan"
 ELEVENLABS_API_KEY = "sk_d7cd9c0991b928ab3a7b9f04b0dedfcd7d56d790f2cca302"
 ELEVENLABS_TTS_URL = "https://api.elevenlabs.io/v1/text-to-speech"
 ELEVENLABS_VOICES_URL = "https://api.elevenlabs.io/v1/voices"
+
+# Frontend model name → Deevid model version mapping
+IMAGE_MODEL_MAP = {
+    'NANO_BANANA_PRO': 'MODEL_FOUR_NANO_BANANA_PRO',
+    'NANO_BANANA':     'MODEL_FOUR_NANO_BANANA',
+    'NANO_BANANA_2':   'MODEL_FOUR_NANO_BANANA_2',
+}
+
+
+# Frontend size value → Deevid size value mapping
+SIZE_MAP = {
+    '16:9': 'SIXTEEN_BY_NINE',
+    '9:16': 'NINE_BY_SIXTEEN',
+    '1:1':  'ONE_BY_ONE',
+    '3:4':  'THREE_BY_FOUR',
+    '4:3':  'FOUR_BY_THREE',
+    '3:2':  'THREE_BY_TWO',
+}
 
 DEVICE_HEADERS = {
     "x-device": "TABLET",
@@ -66,9 +85,9 @@ def verify_api_key():
     api_key_id = db.get_api_key_id(provided_key)
     return api_key_id
 
-def can_start_new_task():
-    """Checks if a new task can be started (max concurrent limit)."""
-    return db.get_running_task_count() < MAX_CONCURRENT_TASKS
+def can_start_new_task(api_key_id):
+    """Checks if a new task can be started (max concurrent limit per user)."""
+    return db.get_running_task_count(api_key_id) < MAX_CONCURRENT_TASKS
 
 def refresh_quota(token):
     """Optional but might be required to activate session."""
@@ -167,7 +186,7 @@ def process_image_task(task_id, params, api_key_id):
             token, account = login_with_retry(api_key_id, task_id=task_id)
             if not token:
                 db.update_task_status(task_id, 'failed')
-                db.add_task_log(task_id, "All accounts failed to login.")
+                db.add_task_log(task_id, "Insufficient quota.")
                 return
 
             # NOT: db.update_task_account() artık burada çağrılmıyor.
@@ -176,9 +195,7 @@ def process_image_task(task_id, params, api_key_id):
             headers = {"authorization": f"Bearer {token}", **DEVICE_HEADERS}
             
             user_image_ids = []
-            images = params.get('images', [])
-            if not images and params.get('image'):  # Geriye dönük uyumluluk
-                images = [params.get('image')]
+            images = params.get('reference_images', [])
 
             for img_base64 in images:
                 img_data = base64.b64decode(img_base64)
@@ -191,16 +208,19 @@ def process_image_task(task_id, params, api_key_id):
                     db.release_account(api_key_id, account['email'])
                     return
 
-            model_version = params.get('model', 'MODEL_FOUR_NANO_BANANA_PRO')
+            model_version_raw = params.get('model', 'NANO_BANANA_PRO')
+            model_version = IMAGE_MODEL_MAP.get(model_version_raw, model_version_raw)
+            image_size_raw = params.get('size', '16:9')
+            image_size = SIZE_MAP.get(image_size_raw, image_size_raw)
             payload = {
                 "prompt": params.get('prompt', ''),
-                "imageSize": params.get('imageSize', 'SIXTEEN_BY_NINE'),
+                "imageSize": image_size,
                 "count": 1,
                 "modelType": "MODEL_FOUR",
                 "modelVersion": model_version
             }
             
-            if model_version == 'MODEL_FOUR_NANO_BANANA_PRO':
+            if model_version in ('MODEL_FOUR_NANO_BANANA_PRO', 'MODEL_FOUR_NANO_BANANA_2'):
                 payload["resolution"] = params.get('resolution', '2K')
                 
             if user_image_ids:
@@ -276,25 +296,28 @@ def process_video_task(task_id, params, api_key_id):
 
             headers = {"authorization": f"Bearer {token}", **DEVICE_HEADERS}
             
-            # Model parametresini al (varsayılan: SORA2)
-            model = params.get('model', 'SORA2')
-            is_i2v = params.get('image') is not None
+            # Model parametresini al (frontend'den VEO_3 veya SORA_2 gelir)
+            model = params.get('model', 'SORA_2')
+            size_raw = params.get('size', '16:9')
+            size = SIZE_MAP.get(size_raw, size_raw)
+            is_i2v = params.get('start_frame') is not None
             
-            # VEO_3_1 modeli için
-            if model == 'VEO_3_1':
+            # VEO_3 modeli için
+            if model == 'VEO_3':
+                end_frame = params.get('end_frame')
                 payload = {
                     "prompt": params.get('prompt', ''),
                     "resolution": "720p",
                     "lengthOfSecond": 8,
-                    "aiPromptEnhance": True,
-                    "size": params.get('size', 'SIXTEEN_BY_NINE'),
-                    "addEndFrame": False,
+                    "aiPromptEnhance": params.get('aiPromptEnhance', True),
+                    "size": size,
+                    "addEndFrame": bool(end_frame),
                     "modelType": "MODEL_FIVE",
                     "modelVersion": "MODEL_FIVE_FAST_3"
                 }
                 
                 if is_i2v:
-                    img_data = base64.b64decode(params['image'])
+                    img_data = base64.b64decode(params['start_frame'])
                     img_id = upload_image(token, img_data)
                     if not img_id:
                         db.update_task_status(task_id, 'failed')
@@ -304,20 +327,53 @@ def process_video_task(task_id, params, api_key_id):
                     url_submit = URL_SUBMIT_VIDEO
                 else:
                     url_submit = URL_SUBMIT_TXT_VIDEO
+
+                if end_frame:
+                    end_frame_data = base64.b64decode(end_frame)
+                    end_frame_id = upload_image(token, end_frame_data)
+                    if not end_frame_id:
+                        db.update_task_status(task_id, 'failed')
+                        db.add_task_log(task_id, "End frame upload failed.")
+                        db.release_account(api_key_id, account['email'])
+                        return
+                    payload["endFrameUserImageId"] = int(str(end_frame_id).strip())
+
+                reference_images = params.get("reference_images", [])
+                if reference_images:
+                    ref_ids = []
+                    for ref_b64 in reference_images:
+                        ref_data = base64.b64decode(ref_b64)
+                        ref_id = upload_image(token, ref_data)
+                        if not ref_id:
+                            db.update_task_status(task_id, "failed")
+                            db.add_task_log(task_id, "Reference image upload failed.")
+                            db.release_account(api_key_id, account["email"])
+                            return
+                        ref_ids.append(int(str(ref_id).strip()))
+                    payload = {
+                        "prompt": params.get('prompt', ''),
+                        "resolution": "720p",
+                        "duration": 8,
+                        "size": size,
+                        "aiPromptEnhance": params.get('aiPromptEnhance', True),
+                        "modelVersion": "MODEL_FIVE_FAST_3",
+                        "userImageIds": ref_ids
+                    }
+                    url_submit = URL_SUBMIT_CHARACTER_VIDEO
             
-            # SORA2 modeli için (varsayılan)
+            # SORA_2 modeli için (varsayılan)
             else:
                 payload = {
                     "prompt": params.get('prompt', ''),
                     "resolution": "720p",
                     "lengthOfSecond": 10,
                     "aiPromptEnhance": True,
-                    "size": params.get('size', 'SIXTEEN_BY_NINE'),
+                    "size": size,
                     "addEndFrame": False
                 }
 
                 if is_i2v:
-                    img_data = base64.b64decode(params['image'])
+                    img_data = base64.b64decode(params['start_frame'])
                     img_id = upload_image(token, img_data)
                     if not img_id:
                         db.update_task_status(task_id, 'failed')
@@ -348,9 +404,21 @@ def process_video_task(task_id, params, api_key_id):
             db.update_task_external_data(task_id, api_task_id, token)
             db.add_task_log(task_id, f"API Task ID: {api_task_id}")
 
-            ref_urls = resp_json['data']['data'].get('inputUserImageUrls') or []
-            if ref_urls:
-                db.update_task_reference_urls(task_id, ref_urls)
+            data_obj = resp_json['data']['data']
+            orig_urls = data_obj.get('originalImageNameUrls') or []
+            end_frame_resp_url = data_obj.get('endFrameUserImageUrl')
+
+            reference_images = params.get("reference_images", [])
+            if reference_images:
+                # Karakter/referans görseller → reference_image_urls
+                if orig_urls:
+                    db.update_task_reference_urls(task_id, orig_urls)
+            else:
+                # Start / end frame → ayrı kolonlara kaydet
+                start_url = orig_urls[0] if orig_urls else None
+                end_url = end_frame_resp_url if end_frame_resp_url else None
+                if start_url or end_url:
+                    db.update_task_frame_urls(task_id, start_frame_url=start_url, end_frame_url=end_url)
             
             for _ in range(600):
                 if _shutdown_event.wait(5):
@@ -669,7 +737,7 @@ def resume_incomplete_tasks():
 
 TASK_FIELDS_BY_MODE = {
     'image': ['task_id', 'mode', 'status', 'result_url', 'prompt', 'model', 'size', 'resolution', 'reference_image_urls', 'logs', 'created_at'],
-    'video': ['task_id', 'mode', 'status', 'result_url', 'prompt', 'model', 'size', 'resolution', 'duration', 'reference_image_urls', 'logs', 'created_at'],
+    'video': ['task_id', 'mode', 'status', 'result_url', 'prompt', 'model', 'size', 'resolution', 'duration', 'start_frame_url', 'end_frame_url', 'reference_image_urls', 'logs', 'created_at'],
     'tts':   ['task_id', 'mode', 'status', 'result_url', 'prompt', 'model', 'logs', 'created_at'],
 }
 
@@ -699,10 +767,17 @@ def generate_image():
     if not data or 'prompt' not in data:
         return jsonify({"error": "Prompt required"}), 400
     
+    images = data.get('reference_images', [])
+    if isinstance(images, list) and len(images) > 5:
+        return jsonify({"error": "Maximum 5 images allowed"}), 400
+
+    if len(data.get('prompt', '')) > 4000:
+        return jsonify({"error": "Prompt must be 4000 characters or less"}), 400
+
     if db.get_account_count(api_key_id) == 0:
-        return jsonify({"error": "No accounts available"}), 503
+        return jsonify({"error": "No quota available"}), 503
     
-    running_count = db.get_running_task_count()
+    running_count = db.get_running_task_count(api_key_id)
     if running_count >= MAX_CONCURRENT_TASKS:
         return jsonify({
             "error": "Maximum concurrent tasks reached",
@@ -710,9 +785,9 @@ def generate_image():
         }), 429
     
     task_id = str(uuid.uuid4())
-    model = data.get('model', 'MODEL_FOUR_NANO_BANANA_PRO')
-    size = data.get('imageSize', 'SIXTEEN_BY_NINE')
-    resolution = data.get('resolution', '2K') if model == 'MODEL_FOUR_NANO_BANANA_PRO' else None
+    model = data.get('model', 'NANO_BANANA_PRO')
+    size = data.get('size', '16:9')
+    resolution = data.get('resolution', '2K') if model in ('NANO_BANANA_PRO', 'NANO_BANANA_2') else None
     db.create_task(api_key_id, task_id, 'image',
                    prompt=data.get('prompt'),
                    model=model,
@@ -732,11 +807,24 @@ def generate_video():
     data = request.json
     if not data or 'prompt' not in data:
         return jsonify({"error": "Prompt required"}), 400
-    
+
+    if len(data.get('prompt', '')) > 2000:
+        return jsonify({"error": "Prompt must be 2000 characters or less"}), 400
+
     if db.get_account_count(api_key_id) == 0:
-        return jsonify({"error": "No accounts available"}), 503
+        return jsonify({"error": "No quota available"}), 503
+
+    if data.get('model') == 'VEO_3' and data.get('end_frame') and not data.get('start_frame'):
+        return jsonify({"error": "end_frame requires image (start frame) to be provided"}), 400
+
+    if data.get('model') == 'VEO_3':
+        reference_images = data.get('reference_images', [])
+        if isinstance(reference_images, list) and len(reference_images) > 3:
+            return jsonify({"error": "Maximum 3 reference images allowed"}), 400
+        if reference_images and (data.get('start_frame') or data.get('end_frame')):
+            return jsonify({"error": "reference_images cannot be used together with image or end_frame"}), 400
     
-    running_count = db.get_running_task_count()
+    running_count = db.get_running_task_count(api_key_id)
     if running_count >= MAX_CONCURRENT_TASKS:
         return jsonify({
             "error": "Maximum concurrent tasks reached",
@@ -744,10 +832,10 @@ def generate_video():
         }), 429
     
     task_id = str(uuid.uuid4())
-    model = data.get('model', 'SORA2')
-    size = data.get('size', 'SIXTEEN_BY_NINE')
+    model = data.get('model', 'SORA_2')
+    size = data.get('size', '16:9')
     resolution = '720p'
-    duration = 8 if model == 'VEO_3_1' else 10
+    duration = 8 if model == 'VEO_3' else 10
     db.create_task(api_key_id, task_id, 'video',
                    prompt=data.get('prompt'),
                    model=model,
@@ -771,7 +859,7 @@ def generate_tts():
     if not ELEVENLABS_API_KEY:
         return jsonify({"error": "ElevenLabs API key not configured"}), 500
     
-    running_count = db.get_running_task_count()
+    running_count = db.get_running_task_count(api_key_id)
     if running_count >= MAX_CONCURRENT_TASKS:
         return jsonify({
             "error": "Maximum concurrent tasks reached",
@@ -822,14 +910,42 @@ def get_task_status(task_id):
     if not task:
         return jsonify({"error": "Task not found"}), 404
     return jsonify(filter_task_fields(task))
-
+    
 @app.route('/api/status', methods=['GET'])
 def get_all_tasks_status():
     api_key_id = verify_api_key()
     if not api_key_id:
         return jsonify({"error": "Unauthorized"}), 401
     
-    running_count = db.get_running_task_count()
+    running_count = db.get_running_task_count(api_key_id)
+
+    page_param = request.args.get('page')
+    if page_param is not None:
+        try:
+            page = max(1, int(page_param))
+        except ValueError:
+            return jsonify({"error": "Invalid page parameter"}), 400
+
+        per_page_param = request.args.get('per_page', 6)
+        try:
+            per_page = max(1, int(per_page_param))
+        except ValueError:
+            return jsonify({"error": "Invalid per_page parameter"}), 400
+
+        tasks, total = db.get_tasks_paginated(api_key_id, page, per_page)
+        import math
+        total_pages = math.ceil(total / per_page) if total > 0 else 1
+
+        return jsonify({
+            "tasks": tasks,
+            "running_tasks": running_count,
+            "max_concurrent": MAX_CONCURRENT_TASKS,
+            "page": page,
+            "per_page": per_page,
+            "total": total,
+            "total_pages": total_pages
+        })
+
     return jsonify({
         "tasks": db.get_all_tasks(api_key_id),
         "running_tasks": running_count,
@@ -842,7 +958,7 @@ def get_quota():
     if not api_key_id:
         return jsonify({"error": "Unauthorized"}), 401
     
-    running_count = db.get_running_task_count()
+    running_count = db.get_running_task_count(api_key_id)
     return jsonify({
         "quota": db.get_account_count(api_key_id),
         "running_tasks": running_count,
