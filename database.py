@@ -77,6 +77,8 @@ def init_db():
                     resolution TEXT,
                     duration INTEGER,
                     reference_image_urls TEXT DEFAULT '[]',
+                    start_frame_url TEXT,
+                    end_frame_url TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
@@ -92,6 +94,8 @@ def init_db():
                 ('resolution', 'TEXT'),
                 ('duration', 'INTEGER'),
                 ('reference_image_urls', "TEXT DEFAULT '[]'"),
+                ('start_frame_url', 'TEXT'),
+                ('end_frame_url', 'TEXT'),
             ]:
                 cursor.execute(
                     "SELECT column_name FROM information_schema.columns WHERE table_name='tasks' AND column_name=%s",
@@ -134,6 +138,14 @@ def init_db():
                     external_task_id TEXT,
                     token TEXT,
                     account_email TEXT,
+                    prompt TEXT,
+                    model TEXT,
+                    size TEXT,
+                    resolution TEXT,
+                    duration INTEGER,
+                    reference_image_urls TEXT DEFAULT '[]',
+                    start_frame_url TEXT,
+                    end_frame_url TEXT,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
@@ -432,6 +444,25 @@ def update_task_reference_urls(task_id, urls):
     )
 
 
+def update_task_frame_urls(task_id, start_frame_url=None, end_frame_url=None):
+    """Saves start and/or end frame URLs for a video task."""
+    if start_frame_url and end_frame_url:
+        _execute_query(
+            'UPDATE tasks SET start_frame_url = %s, end_frame_url = %s WHERE task_id = %s' if DB_TYPE == 'postgresql' else 'UPDATE tasks SET start_frame_url = ?, end_frame_url = ? WHERE task_id = ?',
+            (start_frame_url, end_frame_url, task_id)
+        )
+    elif start_frame_url:
+        _execute_query(
+            'UPDATE tasks SET start_frame_url = %s WHERE task_id = %s' if DB_TYPE == 'postgresql' else 'UPDATE tasks SET start_frame_url = ? WHERE task_id = ?',
+            (start_frame_url, task_id)
+        )
+    elif end_frame_url:
+        _execute_query(
+            'UPDATE tasks SET end_frame_url = %s WHERE task_id = %s' if DB_TYPE == 'postgresql' else 'UPDATE tasks SET end_frame_url = ? WHERE task_id = ?',
+            (end_frame_url, task_id)
+        )
+
+
 def update_task_status(task_id, status, result_url=None):
     """Updates the status and result_url of a task."""
     if result_url:
@@ -480,7 +511,7 @@ def add_task_log(task_id, message):
 def get_task(api_key_id, task_id):
     """Returns task detail."""
     result = _execute_query(
-        'SELECT task_id, mode, status, result_url, logs, prompt, model, size, resolution, duration, reference_image_urls, created_at FROM tasks WHERE api_key_id = %s AND task_id = %s' if DB_TYPE == 'postgresql' else 'SELECT task_id, mode, status, result_url, logs, prompt, model, size, resolution, duration, reference_image_urls, created_at FROM tasks WHERE api_key_id = ? AND task_id = ?',
+        'SELECT task_id, mode, status, result_url, logs, prompt, model, size, resolution, duration, reference_image_urls, start_frame_url, end_frame_url, created_at FROM tasks WHERE api_key_id = %s AND task_id = %s' if DB_TYPE == 'postgresql' else 'SELECT task_id, mode, status, result_url, logs, prompt, model, size, resolution, duration, reference_image_urls, start_frame_url, end_frame_url, created_at FROM tasks WHERE api_key_id = ? AND task_id = ?',
         (api_key_id, task_id),
         fetch_one=True
     )
@@ -498,19 +529,55 @@ def get_all_tasks(api_key_id):
         (api_key_id,),
         fetch_all=True
     )
-    return rows
+    return rows or []
 
 
-def get_running_task_count():
-    """Returns the count of currently running/pending tasks (across all API keys)."""
+def get_tasks_paginated(api_key_id, page, per_page):
+    """Returns paginated tasks and total count for an API key."""
+    offset = (page - 1) * per_page
+
+    total_result = _execute_query(
+        'SELECT COUNT(*) as count FROM tasks WHERE api_key_id = %s' if DB_TYPE == 'postgresql' else 'SELECT COUNT(*) as count FROM tasks WHERE api_key_id = ?',
+        (api_key_id,),
+        fetch_one=True
+    )
+    total = total_result['count'] if total_result else 0
+
+    if DB_TYPE == 'postgresql':
+        rows = _execute_query(
+            'SELECT task_id, mode, status, result_url, created_at FROM tasks WHERE api_key_id = %s ORDER BY created_at DESC LIMIT %s OFFSET %s',
+            (api_key_id, per_page, offset),
+            fetch_all=True
+        )
+    else:
+        rows = _execute_query(
+            'SELECT task_id, mode, status, result_url, created_at FROM tasks WHERE api_key_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?',
+            (api_key_id, per_page, offset),
+            fetch_all=True
+        )
+
+    return rows or [], total
+
+
+def get_running_task_count(api_key_id=None):
+    """Returns the count of currently running/pending tasks (per user if api_key_id given)."""
     with (db_lock if DB_TYPE != 'postgresql' else contextlib.nullcontext()):
         conn = get_connection()
-        query = "SELECT COUNT(*) as count FROM tasks WHERE status IN ('running', 'pending')"
-        if DB_TYPE == 'postgresql':
-            cursor = conn.cursor(cursor_factory=RealDictCursor)
-            cursor.execute(query)
+        if api_key_id is not None:
+            if DB_TYPE == 'postgresql':
+                query = "SELECT COUNT(*) as count FROM tasks WHERE status IN ('running', 'pending') AND api_key_id = %s"
+                cursor = conn.cursor(cursor_factory=RealDictCursor)
+                cursor.execute(query, (api_key_id,))
+            else:
+                query = "SELECT COUNT(*) as count FROM tasks WHERE status IN ('running', 'pending') AND api_key_id = ?"
+                cursor = conn.cursor()
+                cursor.execute(query, (api_key_id,))
         else:
-            cursor = conn.cursor()
+            query = "SELECT COUNT(*) as count FROM tasks WHERE status IN ('running', 'pending')"
+            if DB_TYPE == 'postgresql':
+                cursor = conn.cursor(cursor_factory=RealDictCursor)
+            else:
+                cursor = conn.cursor()
             cursor.execute(query)
         row = cursor.fetchone()
         conn.close()
